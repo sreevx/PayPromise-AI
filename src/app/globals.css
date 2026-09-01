@@ -1,0 +1,98 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+
+:root {
+  --background: #f8fafc;
+  --foreground: #0f172a;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: 'Inter', system-ui, sans-serif;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* Smooth transitions */
+* {
+  transition-property: background-color, border-color, color, opacity, box-shadow;
+  transition-duration: 150ms;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Card hover effect */
+.card-hover {
+  @apply transition-all duration-200;
+}
+.card-hover:hover {
+  @apply shadow-lg -translate-y-0.5;
+}
+
+/* Status badges */
+.badge {
+  @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+}
+.badge-success {
+  @apply bg-green-50 text-green-700 ring-1 ring-inset ring-green-600/20;
+}
+.badge-warning {
+  @apply bg-yellow-50 text-yellow-700 ring-1 ring-inset ring-yellow-600/20;
+}
+.badge-danger {
+  @apply bg-red-50 text-red-700 ring-1 ring-inset ring-red-600/20;
+}
+.badge-info {
+  @apply bg-blue-50 text-blue-700 ring-1 ring-inset ring-blue-600/20;
+}
+.badge-neutral {
+  @apply bg-gray-50 text-gray-600 ring-1 ring-inset ring-gray-500/10;
+}
+
+/* Demo banner */
+.demo-banner {
+  @apply bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-center text-xs py-1.5 font-medium;
+  background-image: repeating-linear-gradient(
+    -45deg,
+    transparent,
+    transparent 10px,
+    rgba(255,255,255,0.05) 10px,
+    rgba(255,255,255,0.05) 20px
+  );
+}
+
+/* Metric card */
+.metric-card {
+  @apply bg-white rounded-xl border border-gray-100 p-6 card-hover;
+}
+
+/* Table styles */
+.table-container {
+  @apply bg-white rounded-xl border border-gray-100 overflow-hidden;
+}
+.table-header {
+  @apply bg-gray-50/80 border-b border-gray-100;
+}
+.table-row {
+  @apply border-b border-gray-50 hover:bg-gray-50/50;
+}
+.table-row:last-child {
+  @apply border-b-0;
+}

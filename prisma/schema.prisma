@@ -1,0 +1,177 @@
+// PayPromise AI - Prisma Schema
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Customer {
+  id            String    @id @default(cuid())
+  name          String
+  email         String
+  company       String
+  phone         String?
+  gstNumber     String?
+  address       String?
+  riskScore     Float     @default(0.5)
+  avgDaysToPay  Float     @default(15)
+  totalPaid     Float     @default(0)
+  totalDue      Float     @default(0)
+  paymentCount  Int       @default(0)
+  latePayments  Int       @default(0)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  invoices    Invoice[]
+  commitments PromiseToPay[]
+}
+
+model Invoice {
+  id               String   @id @default(cuid())
+  invoiceNumber    String   @unique
+  customerId       String
+  amount           Float
+  currency         String   @default("INR")
+  description      String?
+  issuedAt         DateTime
+  dueAt            DateTime
+  paidAt           DateTime?
+  status           String   @default("pending") // pending, overdue, paid, partially_paid, written_off
+  recoveryStatus   String   @default("none") // none, ai_analyzing, message_sent, follow_up, escalated, promise_to_pay, payment_initiated, recovered
+  recoveryProbability Float? @default(0)
+  recommendedAction String?
+  lastFollowUpAt   DateTime?
+  followUpCount    Int      @default(0)
+  escalationLevel  Int      @default(0) // 0=none, 1=ai, 2=human, 3=legal
+  recoverySource   String?  // which action triggered the latest status change
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  customer        Customer        @relation(fields: [customerId], references: [id])
+  commitments     PromiseToPay[]
+  auditLogs       AuditLog[]
+  messages        RecoveryMessage[]
+  paymentLinks    PaymentLink[]
+  payments        Payment[]
+  analyses        RecoveryAnalysis[]
+  aiActions       AIAction[]
+}
+
+model PromiseToPay {
+  id          String   @id @default(cuid())
+  invoiceId   String
+  customerId  String
+  amount      Float
+  promisedAt  DateTime
+  dueDate     DateTime
+  status      String   @default("active") // active, fulfilled, broken, cancelled
+  notes       String?
+  createdAt   DateTime @default(now())
+
+  invoice  Invoice  @relation(fields: [invoiceId], references: [id])
+  customer Customer @relation(fields: [customerId], references: [id])
+}
+
+model RecoveryMessage {
+  id          String   @id @default(cuid())
+  invoiceId   String
+  channel     String   // email, sms, whatsapp
+  subject     String?
+  content     String
+  tone        String   // friendly, firm, urgent, legal
+  sentAt      DateTime @default(now())
+  aiGenerated Boolean  @default(true)
+  metadata    String?  // JSON string for extra data
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id])
+}
+
+model PaymentLink {
+  id          String   @id @default(cuid())
+  invoiceId   String
+  url         String
+  amount      Float
+  status      String   @default("active") // active, used, expired
+  expiresAt   DateTime?
+  createdAt   DateTime @default(now())
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id])
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  invoiceId   String?
+  action      String   // e.g., "ai_analysis", "message_sent", "escalation", "promise_to_pay"
+  actor       String   // "ai", "system", user name
+  details     String?  // JSON string
+  createdAt   DateTime @default(now())
+
+  invoice Invoice? @relation(fields: [invoiceId], references: [id])
+}
+
+model RecoveryAnalysis {
+  id                   String   @id @default(cuid())
+  invoiceId            String
+  recoveryProbability  Float
+  riskLevel            String   // LOW, MEDIUM, HIGH
+  recommendedAction    String   // SEND_REMINDER, REQUEST_PROMISE, CREATE_PAYMENT_LINK, FOLLOW_UP, ESCALATE, STOP
+  reasoning            String
+  followUpDays         Int
+  confidence           Float    @default(0.85)
+  factors              String?  // JSON array of scoring factors
+  createdAt            DateTime @default(now())
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id])
+}
+
+model AIAction {
+  id          String   @id @default(cuid())
+  invoiceId   String?
+  action      String   // e.g. "send_reminder", "escalate", "create_payment_link"
+  reason      String
+  confidence  Float
+  policyDecision String // ALLOW, BLOCK, ESCALATE
+  policyReason  String?
+  result      String?  // JSON string for result details
+  actor       String   @default("engine")
+  createdAt   DateTime @default(now())
+
+  invoice Invoice? @relation(fields: [invoiceId], references: [id])
+}
+
+model Payment {
+  id                 String   @id @default(cuid())
+  invoiceId          String
+  razorpayOrderId    String?
+  razorpayPaymentId  String?  @unique
+  paymentLinkId      String?  // Razorpay payment link ID
+  paymentLinkUrl     String?  // Razorpay payment link URL
+  amount             Float
+  currency           String   @default("INR")
+  status             String   @default("created") // created, active, paid, failed, expired, cancelled
+  method             String?  // card, upi, netbanking, wallet, etc.
+  failureReason      String?
+  razorpayResponse   String?  // JSON of full Razorpay response
+  isDemo             Boolean  @default(false) // true for demo simulation, false for real Razorpay
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id])
+}
+
+model RevenueMetrics {
+  id               String   @id @default("singleton")
+  totalRevenue     Float    @default(0)
+  revenueAtRisk    Float    @default(0)
+  revenueRecovered Float    @default(0)
+  totalInvoices    Int      @default(0)
+  overdueInvoices  Int      @default(0)
+  recoveredInvoices Int     @default(0)
+  avgRecoveryDays  Float    @default(0)
+  aiRecoveryRate   Float    @default(0)
+  updatedAt        DateTime @updatedAt
+}
