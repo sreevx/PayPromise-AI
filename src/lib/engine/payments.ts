@@ -37,6 +37,7 @@ export async function createPayment(invoiceId: string): Promise<PaymentResult> {
   const invoice = await prisma.invoice.findUnique({
     where: { id: invoiceId },
     include: {
+      customer: true,
       payments: {
         where: { status: { in: ['created', 'pending', 'paid'] } },
         orderBy: { createdAt: 'desc' },
