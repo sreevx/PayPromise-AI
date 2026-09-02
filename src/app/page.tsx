@@ -1,302 +1,425 @@
-import { prisma } from '@/lib/prisma';
-import { formatCurrency, formatDate, getDaysOverdue, getRecoveryProbabilityColor, getStatusColor, formatRecoveryStatus, formatRelativeTime } from '@/lib/utils';
 import Link from 'next/link';
+import { prisma } from '@/lib/prisma';
 
-export const dynamic = 'force-dynamic';
+function formatCurrency(amount: number) {
+  return `₹${amount.toLocaleString('en-IN')}`;
+}
 
-export default async function DashboardPage() {
-  // Compute all metrics from real database data
-  const [overdueInvoices, allInvoices, recentAuditLogs, recentAIActions, activePromises, escalatedCount] = await Promise.all([
-    prisma.invoice.findMany({
-      where: { status: 'overdue' },
-      include: { customer: true },
-      orderBy: { dueAt: 'asc' },
-    }),
-    prisma.invoice.findMany({
-      select: { id: true, amount: true, status: true, recoveryProbability: true },
-    }),
-    prisma.auditLog.findMany({
-      take: 8,
-      orderBy: { createdAt: 'desc' },
-      include: { invoice: true },
-    }),
-    prisma.aIAction.findMany({
-      take: 8,
-      orderBy: { createdAt: 'desc' },
-      include: { invoice: true },
-    }),
-    prisma.promiseToPay.findMany({
-      where: { status: 'active' },
-      include: { invoice: true, customer: true },
-      orderBy: { dueDate: 'asc' },
-    }),
-    prisma.invoice.count({
-      where: { escalationLevel: { gte: 1 }, status: { not: 'paid' } },
-    }),
-  ]);
+function formatDate(date: Date | string) {
+  return new Date(date).toLocaleDateString('en-IN', {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+  });
+}
 
-  // Compute metrics from actual data
-  const totalRevenue = allInvoices.reduce((sum, inv) => sum + inv.amount, 0);
-  const revenueAtRisk = overdueInvoices.reduce((sum, inv) => sum + inv.amount, 0);
-  const revenueRecovered = allInvoices
-    .filter(inv => inv.status === 'paid')
-    .reduce((sum, inv) => sum + inv.amount, 0);
-  const totalInvoices = allInvoices.length;
-  const overdueCount = overdueInvoices.length;
-  const recoveredCount = allInvoices.filter(inv => inv.status === 'paid').length;
-  const highRiskCount = overdueInvoices.filter(inv => (inv.recoveryProbability ?? 0) < 0.25).length;
-  const mediumRiskCount = overdueInvoices.filter(inv => {
-    const p = inv.recoveryProbability ?? 0;
-    return p >= 0.25 && p < 0.50;
-  }).length;
+function getStatusStyles(status: string) {
+  const normalized = status.toLowerCase();
 
-  // Combine recent activity from both audit logs and AI actions
-  const allActivity = [
-    ...recentAuditLogs.map(l => ({
-      id: l.id, type: 'legacy' as const, action: l.action, actor: l.actor,
-      invoiceNumber: l.invoice?.invoiceNumber ?? null, invoiceId: l.invoice?.id ?? null,
-      createdAt: l.createdAt,
-    })),
-    ...recentAIActions.map(a => ({
-      id: a.id, type: 'engine' as const, action: a.action, actor: a.actor,
-      invoiceNumber: a.invoice?.invoiceNumber ?? null, invoiceId: a.invoice?.id ?? null,
-      createdAt: a.createdAt,
-    })),
-  ].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()).slice(0, 8);
+  if (
+    normalized === 'paid' ||
+    normalized === 'recovered' ||
+    normalized === 'captured'
+  ) {
+    return 'bg-green-100 text-green-800';
+  }
+
+  if (
+    normalized === 'overdue' ||
+    normalized === 'failed' ||
+    normalized === 'cancelled'
+  ) {
+    return 'bg-red-100 text-red-800';
+  }
+
+  return 'bg-yellow-100 text-yellow-800';
+}
+
+export default async function InvoicesPage() {
+  const invoices = await prisma.invoice.findMany({
+    include: {
+      customer: true,
+
+      payments: {
+        orderBy: {
+          createdAt: 'desc',
+        },
+        take: 1,
+      },
+    },
+
+    orderBy: {
+      createdAt: 'desc',
+    },
+  });
+
+  const totalInvoices = invoices.length;
+
+  const totalAmount = invoices.reduce(
+    (sum, invoice) => sum + Number(invoice.amount),
+    0
+  );
+
+  /*
+   * Determine paid invoices
+   */
+  const paidInvoices = invoices.filter((invoice) => {
+    const payment = invoice.payments[0];
+
+    return (
+      invoice.recoveryStatus === 'paid' ||
+      invoice.status === 'paid' ||
+      payment?.status === 'paid' ||
+      payment?.status === 'captured'
+    );
+  });
+
+  const paidAmount = paidInvoices.reduce(
+    (sum, invoice) => sum + Number(invoice.amount),
+    0
+  );
+
+  /*
+   * Determine overdue invoices
+   */
+  const overdueInvoices = invoices.filter((invoice) => {
+    const payment = invoice.payments[0];
+
+    const isPaid =
+      invoice.recoveryStatus === 'paid' ||
+      invoice.status === 'paid' ||
+      payment?.status === 'paid' ||
+      payment?.status === 'captured';
+
+    return !isPaid && new Date(invoice.dueAt) < new Date();
+  });
+
+  const overdueAmount = overdueInvoices.reduce(
+    (sum, invoice) => sum + Number(invoice.amount),
+    0
+  );
+
+  /*
+   * Recovery rate
+   */
+  const recoveryRate =
+    totalAmount > 0
+      ? Math.round((paidAmount / totalAmount) * 100)
+      : 0;
 
   return (
-    <div className="p-8">
-      {/* Header */}
-      <div className="mb-8">
-        <h1 className="text-2xl font-bold text-gray-900">Revenue Recovery Dashboard</h1>
-        <p className="text-sm text-gray-500 mt-1">Monitor your invoice recovery performance and take action on overdue payments.</p>
-        <p className="text-[10px] text-gray-400 mt-1">Metrics computed from database • {totalInvoices} total invoices</p>
-      </div>
+    <main className="min-h-screen bg-gray-50">
+      <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
 
-      {/* Metrics Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        <div className="metric-card">
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-sm font-medium text-gray-500">Revenue at Risk</span>
-            <span className="w-8 h-8 bg-red-50 rounded-lg flex items-center justify-center text-sm">⚠️</span>
-          </div>
-          <p className="text-2xl font-bold text-red-600">{formatCurrency(revenueAtRisk)}</p>
-          <p className="text-xs text-gray-500 mt-1">{overdueCount} overdue invoices</p>
-        </div>
-        <div className="metric-card">
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-sm font-medium text-gray-500">Revenue Recovered</span>
-            <span className="w-8 h-8 bg-green-50 rounded-lg flex items-center justify-center text-sm">✅</span>
-          </div>
-          <p className="text-2xl font-bold text-green-600">{formatCurrency(revenueRecovered)}</p>
-          <p className="text-xs text-gray-500 mt-1">{recoveredCount} invoices recovered</p>
-        </div>
-        <div className="metric-card">
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-sm font-medium text-gray-500">Active Promises</span>
-            <span className="w-8 h-8 bg-blue-50 rounded-lg flex items-center justify-center text-sm">🤝</span>
-          </div>
-          <p className="text-2xl font-bold text-blue-600">{activePromises.length}</p>
-          <p className="text-xs text-gray-500 mt-1">Pending commitments</p>
-        </div>
-        <div className="metric-card">
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-sm font-medium text-gray-500">Escalated Cases</span>
-            <span className="w-8 h-8 bg-orange-50 rounded-lg flex items-center justify-center text-sm">🚨</span>
-          </div>
-          <p className="text-2xl font-bold text-orange-600">{escalatedCount}</p>
-          <p className="text-xs text-gray-500 mt-1">{highRiskCount} high risk, {mediumRiskCount} medium risk</p>
-        </div>
-      </div>
+        {/* Header */}
+        <div className="mb-8 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+          <div>
+            <p className="text-sm font-medium text-blue-600">
+              PayPromise AI
+            </p>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Overdue Invoices Table */}
-        <div className="lg:col-span-2">
-          <div className="table-container">
-            <div className="px-6 py-4 flex items-center justify-between">
-              <div>
-                <h2 className="text-base font-semibold text-gray-900">Overdue Invoices</h2>
-                <p className="text-xs text-gray-500 mt-0.5">Requiring attention</p>
-              </div>
-              <Link href="/invoices" className="text-sm font-medium text-blue-600 hover:text-blue-700">
-                View all →
-              </Link>
+            <h1 className="mt-1 text-3xl font-bold text-gray-900">
+              Invoices
+            </h1>
+
+            <p className="mt-2 text-gray-600">
+              Monitor invoices, payment recovery and customer risk.
+            </p>
+          </div>
+
+          <Link
+            href="/"
+            className="inline-flex items-center justify-center rounded-lg bg-gray-900 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-gray-800"
+          >
+            ← Dashboard
+          </Link>
+        </div>
+
+        {/* Summary Cards */}
+        <div className="mb-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+
+          {/* Total Invoices */}
+          <section className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+            <p className="text-sm text-gray-500">
+              Total Invoices
+            </p>
+
+            <p className="mt-2 text-2xl font-bold text-gray-900">
+              {totalInvoices}
+            </p>
+          </section>
+
+          {/* Total Value */}
+          <section className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+            <p className="text-sm text-gray-500">
+              Total Value
+            </p>
+
+            <p className="mt-2 text-2xl font-bold text-gray-900">
+              {formatCurrency(totalAmount)}
+            </p>
+          </section>
+
+          {/* Recovered */}
+          <section className="rounded-xl border border-green-200 bg-green-50 p-5 shadow-sm">
+            <p className="text-sm text-green-700">
+              Recovered
+            </p>
+
+            <p className="mt-2 text-2xl font-bold text-green-900">
+              {formatCurrency(paidAmount)}
+            </p>
+
+            <p className="mt-1 text-xs text-green-700">
+              {recoveryRate}% of invoice value
+            </p>
+          </section>
+
+          {/* Overdue */}
+          <section className="rounded-xl border border-red-200 bg-red-50 p-5 shadow-sm">
+            <p className="text-sm text-red-700">
+              Overdue
+            </p>
+
+            <p className="mt-2 text-2xl font-bold text-red-900">
+              {formatCurrency(overdueAmount)}
+            </p>
+
+            <p className="mt-1 text-xs text-red-700">
+              {overdueInvoices.length} invoice
+              {overdueInvoices.length === 1 ? '' : 's'}
+            </p>
+          </section>
+
+        </div>
+
+        {/* Invoice Table */}
+        <section className="overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-sm">
+
+          {/* Table Header */}
+          <div className="border-b border-gray-200 px-6 py-5">
+            <h2 className="text-lg font-semibold text-gray-900">
+              All Invoices
+            </h2>
+
+            <p className="mt-1 text-sm text-gray-500">
+              Select an invoice to view its AI analysis and payment options.
+            </p>
+          </div>
+
+          {/* Empty State */}
+          {invoices.length === 0 ? (
+            <div className="px-6 py-12 text-center">
+              <p className="font-medium text-gray-900">
+                No invoices found
+              </p>
+
+              <p className="mt-1 text-sm text-gray-500">
+                Invoices will appear here once they are created.
+              </p>
             </div>
-            <table className="w-full">
-              <thead>
-                <tr className="table-header">
-                  <th className="px-6 py-3 text-left text-[11px] font-semibold text-gray-500 uppercase tracking-wider">Invoice</th>
-                  <th className="px-6 py-3 text-left text-[11px] font-semibold text-gray-500 uppercase tracking-wider">Customer</th>
-                  <th className="px-6 py-3 text-right text-[11px] font-semibold text-gray-500 uppercase tracking-wider">Amount</th>
-                  <th className="px-6 py-3 text-center text-[11px] font-semibold text-gray-500 uppercase tracking-wider">Days Overdue</th>
-                  <th className="px-6 py-3 text-center text-[11px] font-semibold text-gray-500 uppercase tracking-wider">Recovery %</th>
-                  <th className="px-6 py-3 text-center text-[11px] font-semibold text-gray-500 uppercase tracking-wider">Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {overdueInvoices.slice(0, 8).map((invoice) => (
-                  <tr key={invoice.id} className="table-row">
-                    <td className="px-6 py-3">
-                      <Link href={`/invoices/${invoice.id}`} className="text-sm font-medium text-blue-600 hover:text-blue-700">
-                        {invoice.invoiceNumber}
-                      </Link>
-                      <p className="text-xs text-gray-500 truncate max-w-[200px]">{invoice.description}</p>
-                    </td>
-                    <td className="px-6 py-3">
-                      <p className="text-sm font-medium text-gray-900">{invoice.customer.name}</p>
-                      <p className="text-xs text-gray-500">{invoice.customer.company}</p>
-                    </td>
-                    <td className="px-6 py-3 text-right">
-                      <span className="text-sm font-semibold text-gray-900">{formatCurrency(invoice.amount)}</span>
-                    </td>
-                    <td className="px-6 py-3 text-center">
-                      <span className={`text-sm font-bold ${getDaysOverdue(invoice.dueAt) > 30 ? 'text-red-600' : getDaysOverdue(invoice.dueAt) > 14 ? 'text-orange-500' : 'text-yellow-600'}`}>
-                        {getDaysOverdue(invoice.dueAt)}d
-                      </span>
-                    </td>
-                    <td className="px-6 py-3 text-center">
-                      <span className={`text-sm font-semibold ${getRecoveryProbabilityColor(invoice.recoveryProbability ?? 0)}`}>
-                        {((invoice.recoveryProbability ?? 0) * 100).toFixed(0)}%
-                      </span>
-                    </td>
-                    <td className="px-6 py-3 text-center">
-                      <span className={`badge ${getStatusColor(invoice.status)}`}>
-                        {formatRecoveryStatus(invoice.recoveryStatus)}
-                      </span>
-                    </td>
+          ) : (
+            <div className="overflow-x-auto">
+
+              <table className="min-w-full divide-y divide-gray-200">
+
+                {/* Table Head */}
+                <thead className="bg-gray-50">
+                  <tr>
+
+                    <th className="px-6 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500">
+                      Invoice
+                    </th>
+
+                    <th className="px-6 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500">
+                      Customer
+                    </th>
+
+                    <th className="px-6 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500">
+                      Amount
+                    </th>
+
+                    <th className="px-6 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500">
+                      Due Date
+                    </th>
+
+                    <th className="px-6 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500">
+                      Recovery
+                    </th>
+
+                    <th className="px-6 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-500">
+                      Status
+                    </th>
+
+                    <th className="px-6 py-3 text-right text-xs font-semibold uppercase tracking-wide text-gray-500">
+                      Action
+                    </th>
+
                   </tr>
-                ))}
-              </tbody>
-            </table>
-            {overdueInvoices.length > 8 && (
-              <div className="px-6 py-3 border-t border-gray-100 text-center">
-                <Link href="/invoices" className="text-xs font-medium text-blue-600 hover:text-blue-700">
-                  View {overdueInvoices.length - 8} more overdue invoices →
-                </Link>
-              </div>
-            )}
-          </div>
-        </div>
+                </thead>
 
-        {/* Right Sidebar */}
-        <div className="space-y-6">
-          {/* AI Recovery Opportunities */}
-          <div className="bg-gradient-to-br from-indigo-50 to-blue-50 rounded-xl border border-indigo-100 p-6">
-            <h3 className="text-sm font-semibold text-indigo-900 mb-3">🤖 AI Recovery Opportunities</h3>
-            <p className="text-[10px] text-indigo-600 mb-3">Highest-priority invoices for AI-assisted recovery</p>
-            <div className="space-y-2">
-              {overdueInvoices
-                .filter(inv => (inv.recoveryProbability ?? 0) > 0.25 && (inv.recoveryProbability ?? 0) < 0.75)
-                .sort((a, b) => b.amount - a.amount)
-                .slice(0, 4)
-                .map(inv => (
-                  <Link key={inv.id} href={`/invoices/${inv.id}`} className="block p-3 bg-white/60 rounded-lg hover:bg-white border border-indigo-100/50">
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="text-xs font-semibold text-indigo-900">{inv.invoiceNumber}</span>
-                      <span className="text-xs font-bold text-indigo-700">{formatCurrency(inv.amount)}</span>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-[10px] text-gray-500">{inv.customer.name}</span>
-                      <div className="flex items-center gap-2">
-                        <span className={`text-[10px] font-semibold ${getRecoveryProbabilityColor(inv.recoveryProbability ?? 0)}`}>
-                          {(inv.recoveryProbability ?? 0 * 100).toFixed(0)}% recovery
-                        </span>
-                        <span className="badge badge-info text-[10px]">
-                          {inv.recoveryStatus === 'none' ? 'New' : formatRecoveryStatus(inv.recoveryStatus)}
-                        </span>
-                      </div>
-                    </div>
-                  </Link>
-                ))}
+                {/* Table Body */}
+                <tbody className="divide-y divide-gray-200 bg-white">
+
+                  {invoices.map((invoice) => {
+                    const payment = invoice.payments[0];
+
+                    /*
+                     * recoveryAnalyses does not exist as an
+                     * Invoice Prisma relation, so recoveryScore
+                     * is taken directly from the invoice.
+                     */
+                    const isPaid =
+                      invoice.recoveryStatus === 'paid' ||
+                      invoice.status === 'paid' ||
+                      payment?.status === 'paid' ||
+                      payment?.status === 'captured';
+
+                    const dueDate = new Date(invoice.dueAt);
+
+                    const isOverdue =
+                      !isPaid && dueDate < new Date();
+
+                    const status = isPaid
+                      ? 'Paid'
+                      : isOverdue
+                        ? 'Overdue'
+                        : invoice.status || 'Pending';
+
+                    /*
+                     * Use the invoice recovery score directly.
+                     * Fall back to 33 if no score is available.
+                     */
+                    const recoveryScore =
+  invoice.customer?.riskScore != null
+    ? Number(invoice.customer.riskScore)
+    : 33;
+
+                    return (
+                      <tr
+                        key={invoice.id}
+                        className="transition hover:bg-gray-50"
+                      >
+
+                        {/* Invoice */}
+                        <td className="whitespace-nowrap px-6 py-4">
+
+                          <Link
+                            href={`/invoices/${invoice.id}`}
+                            className="font-semibold text-blue-600 hover:text-blue-800"
+                          >
+                            {invoice.invoiceNumber}
+                          </Link>
+
+                          <p className="mt-1 max-w-xs truncate text-xs text-gray-500">
+                            {invoice.description}
+                          </p>
+
+                        </td>
+
+                        {/* Customer */}
+                        <td className="whitespace-nowrap px-6 py-4">
+
+                          <p className="font-medium text-gray-900">
+                            {invoice.customer?.name ??
+                              'Unknown Customer'}
+                          </p>
+
+                          {invoice.customer?.email && (
+                            <p className="mt-1 text-xs text-gray-500">
+                              {invoice.customer.email}
+                            </p>
+                          )}
+
+                        </td>
+
+                        {/* Amount */}
+                        <td className="whitespace-nowrap px-6 py-4">
+
+                          <span className="font-semibold text-gray-900">
+                            {formatCurrency(
+                              Number(invoice.amount)
+                            )}
+                          </span>
+
+                        </td>
+
+                        {/* Due Date */}
+                        <td className="whitespace-nowrap px-6 py-4 text-sm text-gray-600">
+                          {formatDate(invoice.dueAt)}
+                        </td>
+
+                        {/* Recovery */}
+                        <td className="whitespace-nowrap px-6 py-4">
+
+                          <div className="flex items-center gap-3">
+
+                            <div className="h-2 w-20 overflow-hidden rounded-full bg-gray-100">
+
+                              <div
+                                className="h-full rounded-full bg-blue-600"
+                                style={{
+                                  width: `${Math.min(
+                                    100,
+                                    Math.max(
+                                      0,
+                                      recoveryScore
+                                    )
+                                  )}%`,
+                                }}
+                              />
+
+                            </div>
+
+                            <span className="text-sm font-semibold text-gray-700">
+                              {Math.round(
+                                recoveryScore
+                              )}
+                              %
+                            </span>
+
+                          </div>
+
+                        </td>
+
+                        {/* Status */}
+                        <td className="whitespace-nowrap px-6 py-4">
+
+                          <span
+                            className={`rounded-full px-2.5 py-1 text-xs font-semibold ${getStatusStyles(
+                              status
+                            )}`}
+                          >
+                            {status}
+                          </span>
+
+                        </td>
+
+                        {/* Action */}
+                        <td className="whitespace-nowrap px-6 py-4 text-right">
+
+                          <Link
+                            href={`/invoices/${invoice.id}`}
+                            className="text-sm font-semibold text-blue-600 hover:text-blue-800"
+                          >
+                            View →
+                          </Link>
+
+                        </td>
+
+                      </tr>
+                    );
+                  })}
+
+                </tbody>
+              </table>
+
             </div>
-          </div>
+          )}
 
-          {/* Quick Actions */}
-          <div className="bg-white rounded-xl border border-gray-100 p-6">
-            <h3 className="text-base font-semibold text-gray-900 mb-4">Quick Actions</h3>
-            <div className="space-y-2">
-              <Link href="/invoices" className="flex items-center gap-3 p-3 rounded-lg hover:bg-gray-50 group">
-                <span className="w-9 h-9 bg-blue-50 rounded-lg flex items-center justify-center text-sm group-hover:bg-blue-100">📄</span>
-                <div>
-                  <p className="text-sm font-medium text-gray-900">View All Invoices</p>
-                  <p className="text-xs text-gray-500">Manage and track invoices</p>
-                </div>
-              </Link>
-              <Link href="/customers" className="flex items-center gap-3 p-3 rounded-lg hover:bg-gray-50 group">
-                <span className="w-9 h-9 bg-purple-50 rounded-lg flex items-center justify-center text-sm group-hover:bg-purple-100">👥</span>
-                <div>
-                  <p className="text-sm font-medium text-gray-900">Customer Profiles</p>
-                  <p className="text-xs text-gray-500">View payment histories</p>
-                </div>
-              </Link>
-              <Link href="/follow-ups" className="flex items-center gap-3 p-3 rounded-lg hover:bg-gray-50 group">
-                <span className="w-9 h-9 bg-orange-50 rounded-lg flex items-center justify-center text-sm group-hover:bg-orange-100">🔔</span>
-                <div>
-                  <p className="text-sm font-medium text-gray-900">Pending Follow-ups</p>
-                  <p className="text-xs text-gray-500">{activePromises.length} promises pending</p>
-                </div>
-              </Link>
-              <Link href="/audit" className="flex items-center gap-3 p-3 rounded-lg hover:bg-gray-50 group">
-                <span className="w-9 h-9 bg-green-50 rounded-lg flex items-center justify-center text-sm group-hover:bg-green-100">📋</span>
-                <div>
-                  <p className="text-sm font-medium text-gray-900">Audit Trail</p>
-                  <p className="text-xs text-gray-500">Complete AI activity log</p>
-                </div>
-              </Link>
-            </div>
-          </div>
+        </section>
 
-          {/* Active Promises */}
-          <div className="bg-white rounded-xl border border-gray-100 p-6">
-            <h3 className="text-base font-semibold text-gray-900 mb-4">Active Commitments</h3>
-            {activePromises.length === 0 ? (
-              <p className="text-sm text-gray-500">No active promises</p>
-            ) : (
-              <div className="space-y-3">
-                {activePromises.map((promise) => (
-                  <div key={promise.id} className="p-3 bg-yellow-50/50 rounded-lg border border-yellow-100">
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="text-sm font-medium text-gray-900">{promise.customer.name}</span>
-                      <span className="text-sm font-semibold text-yellow-700">{formatCurrency(promise.amount)}</span>
-                    </div>
-                    <p className="text-xs text-gray-500">{promise.invoice.invoiceNumber} • Due {formatDate(promise.dueDate)}</p>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-
-          {/* Recent Activity */}
-          <div className="bg-white rounded-xl border border-gray-100 p-6">
-            <h3 className="text-base font-semibold text-gray-900 mb-4">Recent AI Activity</h3>
-            <div className="space-y-3">
-              {allActivity.map((log) => (
-                <div key={log.id} className="flex items-start gap-3">
-                  <span className="w-6 h-6 bg-gray-100 rounded-full flex items-center justify-center text-[10px] mt-0.5 flex-shrink-0">
-                    {log.action.includes('analysis') || log.action === 'analyze' ? '🤖' :
-                     log.action.includes('message') || log.action.includes('reminder') ? '📧' :
-                     log.action.includes('escalat') ? '🚨' :
-                     log.action.includes('promise') ? '🤝' :
-                     log.action.includes('payment') ? '💳' :
-                     log.action.includes('follow') ? '🔔' : '📋'}
-                  </span>
-                  <div className="min-w-0">
-                    <p className="text-xs text-gray-900">
-                      <span className="font-medium">{log.actor}</span> • {formatRecoveryStatus(log.action)}
-                      {log.invoiceNumber && (
-                        <Link href={`/invoices/${log.invoiceId}`} className="text-blue-600 hover:text-blue-700 ml-1">
-                          {log.invoiceNumber}
-                        </Link>
-                      )}
-                    </p>
-                    <p className="text-[11px] text-gray-500">{formatRelativeTime(log.createdAt)}</p>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
       </div>
-    </div>
+    </main>
   );
 }

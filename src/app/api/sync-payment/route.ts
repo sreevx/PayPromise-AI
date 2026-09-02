@@ -15,7 +15,7 @@
 //       ↓
 // Order Payments API
 //       ↓
-// captured payment
+// captured / authorized payment
 //       ↓
 // handlePaymentLinkPaid()
 //       ↓
@@ -39,9 +39,7 @@ import {
 // Prevent Next.js from caching this API route.
 export const dynamic = 'force-dynamic';
 
-export async function POST(
-  request: NextRequest
-) {
+export async function POST(request: NextRequest) {
   try {
     // ─────────────────────────────────────────────
     // 1. Read request body
@@ -51,10 +49,7 @@ export async function POST(
 
     const paymentId = body?.paymentId;
 
-    if (
-      !paymentId ||
-      typeof paymentId !== 'string'
-    ) {
+    if (!paymentId || typeof paymentId !== 'string') {
       return NextResponse.json(
         {
           success: false,
@@ -74,12 +69,11 @@ export async function POST(
     // 2. Find payment in database
     // ─────────────────────────────────────────────
 
-    const payment =
-      await prisma.payment.findUnique({
-        where: {
-          id: paymentId,
-        },
-      });
+    const payment = await prisma.payment.findUnique({
+      where: {
+        id: paymentId,
+      },
+    });
 
     if (!payment) {
       console.error(
@@ -134,11 +128,10 @@ export async function POST(
     }
 
     // ─────────────────────────────────────────────
-    // 5. Get Payment Link ID
+    // 5. Get Razorpay Payment Link ID
     // ─────────────────────────────────────────────
 
-    const linkId =
-      payment.paymentLinkId;
+    const linkId = payment.paymentLinkId;
 
     if (!linkId) {
       return NextResponse.json(
@@ -161,10 +154,7 @@ export async function POST(
     // 6. Fetch Payment Link
     // ─────────────────────────────────────────────
 
-    const link =
-      await fetchRazorpayPaymentLink(
-        linkId
-      );
+    const link = await fetchRazorpayPaymentLink(linkId);
 
     console.log(
       '[Sync] Razorpay Payment Link status:',
@@ -178,12 +168,10 @@ export async function POST(
     );
 
     // ─────────────────────────────────────────────
-    // 7. If link is not paid, check failed/active
+    // 7. If link is not paid
     // ─────────────────────────────────────────────
 
-    if (
-      link.status !== 'paid'
-    ) {
+    if (link.status !== 'paid') {
       console.log(
         `[Sync] Payment Link ${linkId} is not paid. Status: ${link.status}`
       );
@@ -219,10 +207,7 @@ export async function POST(
     let payments;
 
     try {
-      payments =
-        await fetchPaymentsForLink(
-          linkId
-        );
+      payments = await fetchPaymentsForLink(linkId);
     } catch (error: any) {
       console.error(
         '[Sync] Failed to retrieve payments:',
@@ -233,10 +218,8 @@ export async function POST(
         {
           success: false,
           status: 'paid',
-
           message:
             'Payment link is paid, but the completed payment details could not be retrieved. Please sync again.',
-
           error:
             error?.message ||
             'Unable to retrieve payment details',
@@ -255,11 +238,9 @@ export async function POST(
     // 10. Find captured payment
     // ─────────────────────────────────────────────
 
-    const successfulPayment =
-      payments.find(
-        (p) =>
-          p.status === 'captured'
-      );
+    const successfulPayment = payments.find(
+      (p) => p.status === 'captured'
+    );
 
     // ─────────────────────────────────────────────
     // 11. Captured payment found
@@ -269,20 +250,11 @@ export async function POST(
       console.log(
         '[Sync] CAPTURED payment found:',
         {
-          paymentId:
-            successfulPayment.id,
-
-          orderId:
-            successfulPayment.order_id,
-
-          amount:
-            successfulPayment.amount,
-
-          status:
-            successfulPayment.status,
-
-          method:
-            successfulPayment.method,
+          paymentId: successfulPayment.id,
+          orderId: successfulPayment.order_id,
+          amount: successfulPayment.amount,
+          status: successfulPayment.status,
+          method: successfulPayment.method,
         }
       );
 
@@ -290,11 +262,11 @@ export async function POST(
       // Process payment
       // ───────────────────────────────────────────
 
-      const result =
-        await handlePaymentLinkPaid(
-          linkId,
-          [successfulPayment]
-        );
+      const result = await handlePaymentLinkPaid(
+        linkId,
+        successfulPayment.id,
+        successfulPayment.order_id
+      );
 
       console.log(
         '[Sync] handlePaymentLinkPaid result:',
@@ -303,17 +275,10 @@ export async function POST(
 
       return NextResponse.json({
         success: result.success,
-
-        message:
-          result.message,
-
+        message: result.message,
         status: 'paid',
-
-        paymentId:
-          successfulPayment.id,
-
-        orderId:
-          successfulPayment.order_id,
+        paymentId: successfulPayment.id,
+        orderId: successfulPayment.order_id,
       });
     }
 
@@ -326,46 +291,39 @@ export async function POST(
     // payments safely.
     // ─────────────────────────────────────────────
 
-    const authorizedPayment =
-      payments.find(
-        (p) =>
-          p.status === 'authorized'
-      );
+    const authorizedPayment = payments.find(
+      (p) => p.status === 'authorized'
+    );
 
     if (authorizedPayment) {
       console.log(
         '[Sync] AUTHORIZED payment found:',
         {
-          paymentId:
-            authorizedPayment.id,
-
-          orderId:
-            authorizedPayment.order_id,
-
-          amount:
-            authorizedPayment.amount,
+          paymentId: authorizedPayment.id,
+          orderId: authorizedPayment.order_id,
+          amount: authorizedPayment.amount,
+          status: authorizedPayment.status,
+          method: authorizedPayment.method,
         }
       );
 
-      const result =
-        await handlePaymentLinkPaid(
-          linkId,
-          [authorizedPayment]
-        );
+      const result = await handlePaymentLinkPaid(
+        linkId,
+        authorizedPayment.id,
+        authorizedPayment.order_id
+      );
+
+      console.log(
+        '[Sync] handlePaymentLinkPaid result:',
+        result
+      );
 
       return NextResponse.json({
         success: result.success,
-
-        message:
-          result.message,
-
+        message: result.message,
         status: 'paid',
-
-        paymentId:
-          authorizedPayment.id,
-
-        orderId:
-          authorizedPayment.order_id,
+        paymentId: authorizedPayment.id,
+        orderId: authorizedPayment.order_id,
       });
     }
 
@@ -373,40 +331,35 @@ export async function POST(
     // 13. Failed payment
     // ─────────────────────────────────────────────
 
-    const failedPayment =
-      payments.find(
-        (p) =>
-          p.status === 'failed'
-      );
+    const failedPayment = payments.find(
+      (p) => p.status === 'failed'
+    );
 
     if (failedPayment) {
       console.log(
         '[Sync] FAILED payment found:',
         {
-          paymentId:
-            failedPayment.id,
-
-          amount:
-            failedPayment.amount,
+          paymentId: failedPayment.id,
+          amount: failedPayment.amount,
+          status: failedPayment.status,
         }
       );
 
-      const result =
-        await handlePaymentLinkFailed(
-          linkId,
-          'Payment failed (detected via manual sync)'
-        );
+      const result = await handlePaymentLinkFailed(
+        linkId,
+        'Payment failed (detected via manual sync)'
+      );
+
+      console.log(
+        '[Sync] handlePaymentLinkFailed result:',
+        result
+      );
 
       return NextResponse.json({
         success: result.success,
-
-        message:
-          result.message,
-
+        message: result.message,
         status: 'failed',
-
-        paymentId:
-          failedPayment.id,
+        paymentId: failedPayment.id,
       });
     }
 
@@ -420,13 +373,10 @@ export async function POST(
 
     return NextResponse.json({
       success: false,
-
       status: 'paid',
-
       message:
         'Payment link is paid, but the completed payment details are not available yet. Please sync again.',
     });
-
   } catch (error: any) {
     // ─────────────────────────────────────────────
     // Global error handler
@@ -440,11 +390,9 @@ export async function POST(
     return NextResponse.json(
       {
         success: false,
-
         error:
           'Sync failed: ' +
-          (error?.message ||
-            'Unknown error'),
+          (error?.message || 'Unknown error'),
       },
       {
         status: 500,

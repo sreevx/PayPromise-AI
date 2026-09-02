@@ -1,765 +1,1204 @@
-// PayPromise AI - Payment Management
-// Handles payment creation, verification, and status tracking.
-// All functions validate from DB — never trust client input.
+// PayPromise AI - Payment Engine
+// Handles Razorpay Checkout payments, demo payments,
+// payment verification, invoice recovery, and promise fulfillment.
+
+import crypto from 'crypto';
 
 import { prisma } from '@/lib/prisma';
+
 import {
-  getRazorpayClient,
   isRazorpayConfigured,
   createRazorpayOrder,
-  createRazorpayPaymentLink,
   fetchRazorpayPayment,
-  fetchRazorpayPaymentLink,
-  fetchPaymentById,
   amountToPaise,
-  verifyWebhookSignature,
 } from '@/lib/razorpay';
+
 import { fulfillPromise } from './promises';
 
-// ── Types ───────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Types
+// ─────────────────────────────────────────────────────────────
 
 export interface PaymentResult {
   success: boolean;
   message: string;
+
   paymentId?: string;
   orderId?: string;
+
   amount?: number;
   currency?: string;
+
   clientSecret?: string;
   razorpayKeyId?: string;
+
   details?: Record<string, unknown>;
 }
 
-// ── Create Payment ──────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Create Payment
+// ─────────────────────────────────────────────────────────────
 
-export async function createPayment(invoiceId: string): Promise<PaymentResult> {
-  // SECURITY: Fetch fresh invoice from DB
-  const invoice = await prisma.invoice.findUnique({
-    where: { id: invoiceId },
-    include: {
-      customer: true,
-      payments: {
-        where: { status: { in: ['created', 'pending', 'paid'] } },
-        orderBy: { createdAt: 'desc' },
-        take: 1,
+export async function createPayment(
+  invoiceId: string
+): Promise<PaymentResult> {
+  try {
+    const invoice = await prisma.invoice.findUnique({
+      where: {
+        id: invoiceId,
       },
-    },
-  });
 
-  if (!invoice) {
-    return { success: false, message: 'Invoice not found.' };
-  }
+      include: {
+        customer: true,
 
-  // Validate invoice status
-  if (invoice.status === 'paid' || invoice.status === 'recovered') {
-    return {
-      success: false,
-      message: 'Invoice is already paid. Cannot create a new payment.',
-    };
-  }
+        payments: {
+          orderBy: {
+            createdAt: 'desc',
+          },
 
-  // Validate amount
-  if (invoice.amount <= 0) {
-    return { success: false, message: 'Invalid invoice amount.' };
-  }
+          take: 10,
+        },
+      },
+    });
 
-  // IDEMPOTENCY: Check for existing active payment
-  if (invoice.payments.length > 0) {
-    const activePayment = invoice.payments[0];
-
-    // If payment is already paid, reject
-    if (activePayment.status === 'paid') {
+    if (!invoice) {
       return {
         success: false,
-        message: `Invoice already has a successful payment (ID: ${
-          activePayment.razorpayPaymentId || activePayment.id
-        }). Invoice is paid.`,
-        paymentId: activePayment.id,
-        orderId: activePayment.razorpayOrderId || undefined,
+        message: 'Invoice not found.',
       };
     }
 
-    // If payment link exists and is active, reuse it
+    // ----------------------------------------------------------
+    // Already paid
+    // ----------------------------------------------------------
+
     if (
-      activePayment.status === 'created' ||
-      activePayment.status === 'active'
+      invoice.status === 'paid' ||
+      invoice.recoveryStatus === 'recovered'
     ) {
       return {
-        success: true,
-        message: `Existing payment link active (Status: ${activePayment.status}). Use the existing link.`,
-        paymentId: activePayment.id,
-        orderId: activePayment.razorpayOrderId || undefined,
-        amount: activePayment.amount,
-        currency: activePayment.currency,
-        razorpayKeyId: activePayment.isDemo
-          ? undefined
-          : process.env.RAZORPAY_KEY_ID,
+        success: false,
+        message: 'This invoice has already been paid.',
       };
     }
 
-    // If payment failed/expired/cancelled, allow creating a new one
-  }
+    // ----------------------------------------------------------
+    // Validate amount
+    // ----------------------------------------------------------
 
-  // Check if Razorpay is configured
-  if (!isRazorpayConfigured()) {
-    // Demo mode: create a simulated payment
-    return createDemoPayment(invoice);
-  }
+    const amount = Number(invoice.amount);
 
-  // Create Razorpay payment link
-  try {
-    // Calculate expiry: 7 days from now
-    const expireBy =
-      Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60;
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return {
+        success: false,
+        message: 'Invalid invoice amount.',
+      };
+    }
 
-    const paymentLink = await createRazorpayPaymentLink({
-      amount: amountToPaise(invoice.amount),
-      currency: invoice.currency,
-      description: `Payment for Invoice ${invoice.invoiceNumber} — ${
-        invoice.description || 'PayPromise AI'
-      }`,
-      customer: {
-        name: invoice.customer?.name || 'Customer',
-        email: invoice.customer?.email,
-        contact: invoice.customer?.phone || undefined,
-      },
-      notes: {
-        invoiceId: invoice.id,
-        invoiceNumber: invoice.invoiceNumber,
-      },
-      expireBy,
-      notify: {
-        sms: false,
-        email: true,
-        whatsapp: false,
-      },
-    });
+    const currency = invoice.currency || 'INR';
 
-    // Store payment record with link info
-    const payment = await prisma.payment.create({
-      data: {
-        invoiceId: invoice.id,
-        razorpayOrderId: paymentLink.id,
-        paymentLinkId: paymentLink.id,
-        paymentLinkUrl: paymentLink.short_url,
-        amount: invoice.amount,
-        currency: invoice.currency,
-        status: 'active',
-        isDemo: false,
-      },
-    });
+    // ----------------------------------------------------------
+    // Reuse existing payment
+    // ----------------------------------------------------------
 
-    // Update invoice status
+    const existingPayment = invoice.payments.find(
+      (payment) =>
+        [
+          'created',
+          'pending',
+          'active',
+          'paid',
+        ].includes(payment.status)
+    );
+
+    if (existingPayment) {
+      return {
+        success: existingPayment.status !== 'paid',
+
+        message:
+          existingPayment.status === 'paid'
+            ? 'Payment has already been completed.'
+            : 'An active payment already exists for this invoice.',
+
+        paymentId: existingPayment.id,
+
+        orderId:
+          existingPayment.razorpayOrderId ||
+          undefined,
+
+        amount:
+          Number(existingPayment.amount),
+
+        currency:
+          existingPayment.currency ||
+          currency,
+
+        razorpayKeyId:
+          isRazorpayConfigured()
+            ? process.env.RAZORPAY_KEY_ID
+            : undefined,
+
+        details: {
+          reused: true,
+          status: existingPayment.status,
+        },
+      };
+    }
+
+    // ----------------------------------------------------------
+    // Demo fallback
+    // ----------------------------------------------------------
+
+    if (!isRazorpayConfigured()) {
+      return createDemoPayment(invoice);
+    }
+
+    // ----------------------------------------------------------
+    // Create Razorpay Order
+    // ----------------------------------------------------------
+
+    const razorpayOrder =
+      await createRazorpayOrder({
+        amount: amountToPaise(amount),
+
+        currency,
+
+        receipt:
+          `invoice_${invoice.id}`,
+
+        notes: {
+          invoiceId:
+            invoice.id,
+
+          invoiceNumber:
+            invoice.invoiceNumber,
+
+          customerId:
+            invoice.customerId,
+
+          customerName:
+            invoice.customer?.name || '',
+        },
+      });
+
+    // ----------------------------------------------------------
+    // Store payment
+    // ----------------------------------------------------------
+
+    const payment =
+      await prisma.payment.create({
+        data: {
+          invoiceId:
+            invoice.id,
+
+          razorpayOrderId:
+            razorpayOrder.id,
+
+          paymentLinkId:
+            null,
+
+          paymentLinkUrl:
+            null,
+
+          amount,
+
+          currency,
+
+          status:
+            'active',
+
+          isDemo:
+            false,
+        },
+      });
+
+    // ----------------------------------------------------------
+    // Update invoice recovery status
+    // ----------------------------------------------------------
+
     await prisma.invoice.update({
-      where: { id: invoiceId },
+      where: {
+        id: invoice.id,
+      },
+
       data: {
-        recoveryStatus: 'payment_initiated',
-        lastFollowUpAt: new Date(),
+        recoveryStatus:
+          'payment_initiated',
       },
     });
 
-    // Record action
+    // ----------------------------------------------------------
+    // Audit AI action
+    //
+    // AIAction schema:
+    // action
+    // reason
+    // confidence
+    // policyDecision
+    // policyReason
+    // result
+    // actor
+    // ----------------------------------------------------------
+
     await prisma.aIAction.create({
       data: {
-        invoiceId,
-        action: 'payment_link_created',
-        reason: `Razorpay Test Mode payment link created for ₹${invoice.amount.toLocaleString(
-          'en-IN'
-        )}.`,
-        confidence: 1.0,
-        policyDecision: 'ALLOW',
-        policyReason: 'Payment creation authorized.',
-        result: JSON.stringify({
-          paymentLinkId: paymentLink.id,
-          paymentLinkUrl: paymentLink.short_url,
-          amount: invoice.amount,
-          paymentId: payment.id,
-          expiresAt: new Date(expireBy * 1000).toISOString(),
-          demo: false,
-        }),
-        actor: 'system',
+        invoiceId:
+          invoice.id,
+
+        action:
+          'payment_link_created',
+
+        reason:
+          'Razorpay Checkout payment order created for invoice recovery.',
+
+        confidence:
+          1,
+
+        policyDecision:
+          'ALLOW',
+
+        policyReason:
+          'Payment creation permitted by the recovery engine.',
+
+        result:
+          JSON.stringify({
+            provider:
+              'razorpay',
+
+            orderId:
+              razorpayOrder.id,
+
+            paymentId:
+              payment.id,
+
+            amount,
+
+            currency,
+
+            testMode:
+              process.env.RAZORPAY_KEY_ID?.startsWith(
+                'rzp_test_'
+              ) || false,
+          }),
+
+        actor:
+          'engine',
       },
     });
 
     return {
       success: true,
-      message: `Razorpay Test Mode payment link created for ₹${invoice.amount.toLocaleString(
-        'en-IN'
-      )}.`,
-      paymentId: payment.id,
-      orderId: paymentLink.id,
-      amount: invoice.amount,
-      currency: invoice.currency,
-      razorpayKeyId: process.env.RAZORPAY_KEY_ID,
+
+      message:
+        'Razorpay payment order created successfully.',
+
+      paymentId:
+        payment.id,
+
+      orderId:
+        razorpayOrder.id,
+
+      amount:
+        razorpayOrder.amount,
+
+      currency:
+        razorpayOrder.currency,
+
+      razorpayKeyId:
+        process.env.RAZORPAY_KEY_ID,
+
+      details: {
+        provider:
+          'razorpay',
+
+        testMode:
+          process.env.RAZORPAY_KEY_ID?.startsWith(
+            'rzp_test_'
+          ) || false,
+      },
     };
-  } catch (error: any) {
+  } catch (error) {
+    console.error(
+      '[Payment] Failed to create payment:',
+      error
+    );
+
     return {
       success: false,
-      message: `Failed to create Razorpay payment link: ${error.message}`,
+
+      message:
+        error instanceof Error
+          ? error.message
+          : 'Failed to create payment.',
     };
   }
 }
 
-// ── Demo Payment ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Demo Payment
+// ─────────────────────────────────────────────────────────────
 
-async function createDemoPayment(invoice: any): Promise<PaymentResult> {
-  const payment = await prisma.payment.create({
-    data: {
-      invoiceId: invoice.id,
-      razorpayOrderId: `order_demo_${Date.now()}`,
-      paymentLinkId: `link_demo_${Date.now()}`,
-      paymentLinkUrl: null,
-      amount: invoice.amount,
-      currency: invoice.currency,
-      status: 'active',
-      isDemo: true,
-    },
-  });
+async function createDemoPayment(
+  invoice: any
+): Promise<PaymentResult> {
+  try {
+    const payment =
+      await prisma.payment.create({
+        data: {
+          invoiceId:
+            invoice.id,
 
-  await prisma.invoice.update({
-    where: { id: invoice.id },
-    data: {
-      recoveryStatus: 'payment_initiated',
-      lastFollowUpAt: new Date(),
-    },
-  });
+          razorpayOrderId:
+            null,
 
-  await prisma.aIAction.create({
-    data: {
-      invoiceId: invoice.id,
-      action: 'payment_link_created',
-      reason: `DEMO SIMULATION — Razorpay Test Mode not configured. Simulated payment link created for ₹${invoice.amount.toLocaleString(
-        'en-IN'
-      )}.`,
-      confidence: 1.0,
-      policyDecision: 'ALLOW',
-      policyReason: 'Demo mode — no real payment created.',
-      result: JSON.stringify({
-        paymentLinkId: payment.paymentLinkId,
-        orderId: payment.razorpayOrderId,
-        amount: invoice.amount,
-        paymentId: payment.id,
-        demo: true,
-      }),
-      actor: 'system',
-    },
-  });
+          paymentLinkId:
+            null,
 
-  return {
-    success: true,
-    message: `DEMO SIMULATION: Payment link created for ₹${invoice.amount.toLocaleString(
-      'en-IN'
-    )} (Razorpay Test Mode not configured — no real payment link).`,
-    paymentId: payment.id,
-    orderId: payment.razorpayOrderId || undefined,
-    amount: invoice.amount,
-    currency: invoice.currency,
-  };
+          paymentLinkUrl:
+            null,
+
+          amount:
+            Number(invoice.amount),
+
+          currency:
+            invoice.currency || 'INR',
+
+          status:
+            'active',
+
+          isDemo:
+            true,
+        },
+      });
+
+    await prisma.invoice.update({
+      where: {
+        id: invoice.id,
+      },
+
+      data: {
+        recoveryStatus:
+          'payment_initiated',
+      },
+    });
+
+    await prisma.aIAction.create({
+      data: {
+        invoiceId:
+          invoice.id,
+
+        action:
+          'payment_link_created',
+
+        reason:
+          'Demo payment created because Razorpay is not configured.',
+
+        confidence:
+          1,
+
+        policyDecision:
+          'ALLOW',
+
+        policyReason:
+          'Demo payment fallback permitted by the payment engine.',
+
+        result:
+          JSON.stringify({
+            provider:
+              'demo',
+
+            paymentId:
+              payment.id,
+
+            amount:
+              Number(invoice.amount),
+
+            currency:
+              invoice.currency || 'INR',
+          }),
+
+        actor:
+          'engine',
+      },
+    });
+
+    return {
+      success: true,
+
+      message:
+        'Demo payment created successfully.',
+
+      paymentId:
+        payment.id,
+
+      amount:
+        Number(invoice.amount),
+
+      currency:
+        invoice.currency || 'INR',
+
+      details: {
+        provider:
+          'demo',
+
+        demo:
+          true,
+      },
+    };
+  } catch (error) {
+    console.error(
+      '[Payment] Failed to create demo payment:',
+      error
+    );
+
+    return {
+      success: false,
+
+      message:
+        error instanceof Error
+          ? error.message
+          : 'Failed to create demo payment.',
+    };
+  }
 }
 
-// ── Handle Successful Payment ────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Razorpay Checkout Success
+// ─────────────────────────────────────────────────────────────
 
 export async function handlePaymentSuccess(
   razorpayPaymentId: string,
   razorpayOrderId: string,
   razorpaySignature?: string
 ): Promise<PaymentResult> {
-  // Verify webhook signature if provided
-  // NOTE: The webhook route already verifies the raw request signature.
-  // Do not attempt to verify an empty body here.
-  if (razorpaySignature && !razorpaySignature.trim()) {
-    return {
-      success: false,
-      message: 'Invalid webhook signature.',
-    };
-  }
+  try {
+    if (
+      !razorpayPaymentId ||
+      !razorpayOrderId
+    ) {
+      return {
+        success: false,
 
-  // Find payment record
-  const payment = await prisma.payment.findFirst({
-    where: { razorpayOrderId },
-  });
+        message:
+          'Missing Razorpay payment or order ID.',
+      };
+    }
 
-  if (!payment) {
-    return {
-      success: false,
-      message: 'No payment record found for this order.',
-    };
-  }
+    // ----------------------------------------------------------
+    // Find local payment
+    // ----------------------------------------------------------
 
-  // Idempotency
-  if (payment.status === 'paid') {
-    return {
-      success: true,
-      message: 'Payment already processed.',
-      paymentId: payment.id,
-    };
-  }
+    const payment =
+      await prisma.payment.findFirst({
+        where: {
+          razorpayOrderId,
+        },
 
-  let updatedPayment = payment;
+        include: {
+          invoice: true,
+        },
+      });
 
-  // Fetch payment details from Razorpay
-  if (isRazorpayConfigured()) {
-    try {
-      const razorpayPayment =
-        await fetchRazorpayPayment(razorpayPaymentId);
+    if (!payment) {
+      return {
+        success: false,
 
-      if (
-        razorpayPayment.status !== 'captured' &&
-        razorpayPayment.status !== 'authorized'
-      ) {
+        message:
+          'Payment order was not found in PayPromise AI.',
+      };
+    }
+
+    // ----------------------------------------------------------
+    // Idempotency
+    // ----------------------------------------------------------
+
+    if (payment.status === 'paid') {
+      return {
+        success: true,
+
+        message:
+          'Payment has already been processed.',
+
+        paymentId:
+          payment.id,
+
+        orderId:
+          razorpayOrderId,
+
+        amount:
+          Number(payment.amount),
+
+        currency:
+          payment.currency || 'INR',
+      };
+    }
+
+    // ----------------------------------------------------------
+    // Razorpay payment verification
+    // ----------------------------------------------------------
+
+    if (!payment.isDemo) {
+      if (!isRazorpayConfigured()) {
         return {
           success: false,
-          message: `Payment not captured. Status: ${razorpayPayment.status}`,
+
+          message:
+            'Razorpay is not configured on the server.',
         };
       }
 
-      updatedPayment = await prisma.payment.update({
-        where: { id: payment.id },
+      if (!razorpaySignature) {
+        return {
+          success: false,
+
+          message:
+            'Razorpay payment signature is missing.',
+        };
+      }
+
+      const secret =
+        process.env.RAZORPAY_KEY_SECRET;
+
+      if (!secret) {
+        return {
+          success: false,
+
+          message:
+            'Razorpay secret is not configured.',
+        };
+      }
+
+      // --------------------------------------------------------
+      // Verify Checkout signature
+      // --------------------------------------------------------
+
+      const generatedSignature =
+        crypto
+          .createHmac(
+            'sha256',
+            secret
+          )
+          .update(
+            `${razorpayOrderId}|${razorpayPaymentId}`
+          )
+          .digest('hex');
+
+      const expected =
+        Buffer.from(
+          generatedSignature,
+          'utf8'
+        );
+
+      const received =
+        Buffer.from(
+          razorpaySignature,
+          'utf8'
+        );
+
+      if (
+        expected.length !==
+          received.length ||
+        !crypto.timingSafeEqual(
+          expected,
+          received
+        )
+      ) {
+        console.error(
+          '[Payment] Invalid Razorpay signature.'
+        );
+
+        return {
+          success: false,
+
+          message:
+            'Payment verification failed.',
+        };
+      }
+
+      // --------------------------------------------------------
+      // Fetch payment directly from Razorpay
+      // --------------------------------------------------------
+
+      const razorpayPayment =
+        await fetchRazorpayPayment(
+          razorpayPaymentId
+        );
+
+      // --------------------------------------------------------
+      // Verify payment belongs to this order
+      // --------------------------------------------------------
+
+      if (
+        razorpayPayment.orderId !==
+        razorpayOrderId
+      ) {
+        console.error(
+          '[Payment] Payment/order mismatch.',
+          {
+            expectedOrderId:
+              razorpayOrderId,
+
+            receivedOrderId:
+              razorpayPayment.orderId,
+          }
+        );
+
+        return {
+          success: false,
+
+          message:
+            'Payment does not belong to this order.',
+        };
+      }
+
+      // --------------------------------------------------------
+      // Verify amount
+      // --------------------------------------------------------
+
+      const expectedAmount =
+        amountToPaise(
+          Number(payment.amount)
+        );
+
+      if (
+        razorpayPayment.amount !==
+        expectedAmount
+      ) {
+        console.error(
+          '[Payment] Amount mismatch.',
+          {
+            expectedAmount,
+
+            receivedAmount:
+              razorpayPayment.amount,
+          }
+        );
+
+        return {
+          success: false,
+
+          message:
+            'Payment amount verification failed.',
+        };
+      }
+
+      // --------------------------------------------------------
+      // Verify payment status
+      // --------------------------------------------------------
+
+      if (
+        razorpayPayment.status !==
+          'captured' &&
+        razorpayPayment.status !==
+          'authorized'
+      ) {
+        return {
+          success: false,
+
+          message:
+            `Razorpay payment is not successful. Current status: ${razorpayPayment.status}`,
+        };
+      }
+
+      // --------------------------------------------------------
+      // Mark payment paid
+      //
+      // Payment model does NOT contain paidAt.
+      // updatedAt is automatically maintained by Prisma.
+      // --------------------------------------------------------
+
+      await prisma.payment.update({
+        where: {
+          id: payment.id,
+        },
+
         data: {
-          razorpayPaymentId,
-          amount: razorpayPayment.amount / 100,
-          status: 'paid',
-          method: razorpayPayment.method,
-          razorpayResponse: JSON.stringify(razorpayPayment),
+          status:
+            'paid',
+
+          razorpayPaymentId:
+            razorpayPaymentId,
+
+          razorpayResponse:
+            JSON.stringify(
+              razorpayPayment
+            ),
+
+          method:
+            razorpayPayment.method ||
+            undefined,
         },
       });
-    } catch (error: any) {
-      console.error(
-        '[Payment] Failed to verify payment with Razorpay:',
-        error.message
-      );
-
-      return {
-        success: false,
-        message: `Payment verification failed: ${error.message}`,
-      };
     }
-  } else {
-    updatedPayment = await prisma.payment.update({
-      where: { id: payment.id },
+
+    // ----------------------------------------------------------
+    // Mark invoice recovered
+    // ----------------------------------------------------------
+
+    const updatedInvoice =
+      await prisma.invoice.update({
+        where: {
+          id:
+            payment.invoiceId,
+        },
+
+        data: {
+          status:
+            'paid',
+
+          paidAt:
+            new Date(),
+
+          recoveryStatus:
+            'recovered',
+
+          recoverySource:
+            'razorpay_payment',
+        },
+      });
+
+    // ----------------------------------------------------------
+    // Fulfill active promise
+    // ----------------------------------------------------------
+
+    try {
+      await fulfillPromise(
+        payment.invoiceId
+      );
+    } catch (promiseError) {
+      console.error(
+        '[Payment] Promise fulfillment failed:',
+        promiseError
+      );
+    }
+
+    // ----------------------------------------------------------
+    // Audit action
+    // ----------------------------------------------------------
+
+    await prisma.aIAction.create({
       data: {
-        razorpayPaymentId,
-        status: 'paid',
-        method: 'demo',
+        invoiceId:
+          payment.invoiceId,
+
+        action:
+          'payment_received',
+
+        reason:
+          'Payment successfully verified and invoice recovered.',
+
+        confidence:
+          1,
+
+        policyDecision:
+          'ALLOW',
+
+        policyReason:
+          'Payment was successfully verified.',
+
+        result:
+          JSON.stringify({
+            provider:
+              payment.isDemo
+                ? 'demo'
+                : 'razorpay',
+
+            razorpayPaymentId,
+
+            razorpayOrderId,
+
+            amount:
+              Number(payment.amount),
+
+            currency:
+              payment.currency,
+
+            invoiceStatus:
+              updatedInvoice.status,
+          }),
+
+        actor:
+          'engine',
       },
     });
-  }
 
-  if (!updatedPayment.invoiceId) {
-    return {
-      success: false,
-      message: 'Payment record has no associated invoice.',
-    };
-  }
-
-  // Mark invoice as paid
-  await prisma.invoice.update({
-    where: { id: updatedPayment.invoiceId },
-    data: {
-      status: 'paid',
-      paidAt: new Date(),
-      recoveryStatus: 'recovered',
-      recoverySource: 'razorpay_payment',
-    },
-  });
-
-  // Fulfill active promises
-  const activePromises = await prisma.promiseToPay.findMany({
-    where: {
-      invoiceId: updatedPayment.invoiceId,
-      status: 'active',
-    },
-  });
-
-  for (const promise of activePromises) {
-    await fulfillPromise(promise.id);
-  }
-
-  // Record success action
-  await prisma.aIAction.create({
-    data: {
-      invoiceId: updatedPayment.invoiceId,
-      action: 'payment_received',
-      reason: `Payment of ₹${updatedPayment.amount.toLocaleString(
-        'en-IN'
-      )} received via ${updatedPayment.method || 'unknown'}.`,
-      confidence: 1.0,
-      policyDecision: 'ALLOW',
-      policyReason: 'Verified payment received.',
-      result: JSON.stringify({
-        paymentId: razorpayPaymentId,
-        orderId: razorpayOrderId,
-        amount: updatedPayment.amount,
-        method: updatedPayment.method,
-        status: 'SUCCESS',
-      }),
-      actor: 'system',
-    },
-  });
-
-  return {
-    success: true,
-    message: `Payment of ₹${updatedPayment.amount.toLocaleString(
-      'en-IN'
-    )} confirmed. Invoice marked as paid.`,
-    paymentId: updatedPayment.id,
-    amount: updatedPayment.amount,
-  };
-}
-
-// ── Handle Failed Payment ────────────────────────────────────
-
-export async function handlePaymentFailure(
-  razorpayPaymentId: string,
-  razorpayOrderId: string,
-  failureReason: string
-): Promise<PaymentResult> {
-  const payment = await prisma.payment.findFirst({
-    where: { razorpayOrderId },
-  });
-
-  if (!payment) {
-    return {
-      success: false,
-      message: 'No payment record found for this order.',
-    };
-  }
-
-  if (payment.status === 'failed') {
     return {
       success: true,
-      message: 'Failure already recorded.',
+
+      message:
+        'Payment verified successfully. Invoice marked as paid.',
+
+      paymentId:
+        payment.id,
+
+      orderId:
+        razorpayOrderId,
+
+      amount:
+        Number(payment.amount),
+
+      currency:
+        payment.currency,
     };
-  }
-
-  await prisma.payment.update({
-    where: { id: payment.id },
-    data: {
-      status: 'failed',
-      failureReason,
-      razorpayPaymentId,
-    },
-  });
-
-  await prisma.aIAction.create({
-    data: {
-      invoiceId: payment.invoiceId,
-      action: 'payment_failed',
-      reason: `Payment failed: ${failureReason}`,
-      confidence: 1.0,
-      policyDecision: 'ALLOW',
-      policyReason: 'Payment failure recorded.',
-      result: JSON.stringify({
-        paymentId: razorpayPaymentId,
-        orderId: razorpayOrderId,
-        amount: payment.amount,
-        failureReason,
-        status: 'FAILED',
-      }),
-      actor: 'system',
-    },
-  });
-
-  return {
-    success: true,
-    message: 'Payment failure recorded. Invoice remains outstanding.',
-    paymentId: payment.id,
-  };
-}
-
-// ── Handle Payment Link Paid ─────────────────────────────────
-
-export async function handlePaymentLinkPaid(
-  paymentLinkId: string,
-  payments: any[],
-  razorpaySignature?: string
-): Promise<PaymentResult> {
-  // Find our payment record
-  const payment = await prisma.payment.findFirst({
-    where: { paymentLinkId },
-  });
-
-  if (!payment) {
+  } catch (error) {
     console.error(
-      `[Payment] No payment record found for link: ${paymentLinkId}`
+      '[Payment] Payment success handler failed:',
+      error
     );
 
     return {
       success: false,
-      message: `No payment record found for link ${paymentLinkId}.`,
+
+      message:
+        error instanceof Error
+          ? error.message
+          : 'Failed to process successful payment.',
     };
   }
+}
 
-  // Idempotency
-  if (payment.status === 'paid') {
-    return {
-      success: true,
-      message: 'Payment already processed.',
-      paymentId: payment.id,
-    };
-  }
+// ─────────────────────────────────────────────────────────────
+// Payment Failure
+// ─────────────────────────────────────────────────────────────
 
-  // Find a captured/authorized payment from the webhook payload
-  const completedPayment = payments?.find(
-    (p: any) =>
-      p?.status === 'captured' ||
-      p?.status === 'authorized'
-  );
+export async function handlePaymentFailure(
+  paymentId: string,
+  reason?: string
+): Promise<PaymentResult> {
+  try {
+    const payment =
+      await prisma.payment.findUnique({
+        where: {
+          id:
+            paymentId,
+        },
 
-  // If the payment details are not directly available,
-  // try the latest payment supplied by Razorpay.
-  if (!completedPayment) {
-    if (isRazorpayConfigured() && payments?.length > 0) {
-      try {
-        const latestPayment = payments[payments.length - 1];
+        include: {
+          invoice: true,
+        },
+      });
 
-        if (latestPayment?.id) {
-          const verified =
-            await fetchPaymentById(latestPayment.id);
-
-          if (
-            verified.status === 'captured' ||
-            verified.status === 'authorized'
-          ) {
-            return await processSuccessfulPayment(
-              payment,
-              verified.id,
-              verified
-            );
-          }
-        }
-      } catch (error: any) {
-        console.error(
-          '[Payment] Failed to verify payment:',
-          error.message
-        );
-      }
-    }
-
-    return {
-      success: false,
-      message: 'No captured payment found in Payment Link event.',
-    };
-  }
-
-  // Verify the payment directly with Razorpay
-  if (isRazorpayConfigured()) {
-    try {
-      const verified =
-        await fetchPaymentById(completedPayment.id);
-
-      if (
-        verified.status !== 'captured' &&
-        verified.status !== 'authorized'
-      ) {
-        return {
-          success: false,
-          message: `Payment not captured. Status: ${verified.status}`,
-        };
-      }
-
-      return await processSuccessfulPayment(
-        payment,
-        verified.id,
-        verified
-      );
-    } catch (error: any) {
-      console.error(
-        '[Payment] Verification failed:',
-        error.message
-      );
-
+    if (!payment) {
       return {
         success: false,
-        message: `Payment verification failed: ${error.message}`,
+
+        message:
+          'Payment not found.',
       };
     }
-  }
 
-  // Fallback for demo/non-configured environments
-  return await processSuccessfulPayment(
-    payment,
-    completedPayment.id,
-    {
-      id: completedPayment.id,
-      amount: completedPayment.amount,
-      status: completedPayment.status,
-      method: completedPayment.method || null,
-    }
-  );
-}
+    await prisma.payment.update({
+      where: {
+        id:
+          payment.id,
+      },
 
-// ── Process Successful Payment ───────────────────────────────
+      data: {
+        status:
+          'failed',
 
-async function processSuccessfulPayment(
-  payment: any,
-  razorpayPaymentId: string,
-  verifiedData: {
-    id: string;
-    amount: number;
-    status: string;
-    method: string | null;
-  }
-): Promise<PaymentResult> {
-  // Update payment record
-  const updatedPayment = await prisma.payment.update({
-    where: { id: payment.id },
-    data: {
-      razorpayPaymentId,
-      amount: verifiedData.amount / 100,
-      status: 'paid',
-      method: verifiedData.method,
-      razorpayResponse: JSON.stringify(verifiedData),
-    },
-  });
+        failureReason:
+          reason || undefined,
 
-  if (!updatedPayment.invoiceId) {
-    return {
-      success: false,
-      message: 'Payment has no associated invoice.',
-    };
-  }
+        razorpayResponse:
+          reason
+            ? JSON.stringify({
+                reason,
+              })
+            : undefined,
+      },
+    });
 
-  // Mark invoice as paid
-  await prisma.invoice.update({
-    where: { id: updatedPayment.invoiceId },
-    data: {
-      status: 'paid',
-      paidAt: new Date(),
-      recoveryStatus: 'recovered',
-      recoverySource: 'razorpay_payment_link',
-    },
-  });
+    await prisma.aIAction.create({
+      data: {
+        invoiceId:
+          payment.invoiceId,
 
-  // Fulfill active promises
-  const activePromises = await prisma.promiseToPay.findMany({
-    where: {
-      invoiceId: updatedPayment.invoiceId,
-      status: 'active',
-    },
-  });
+        action:
+          'payment_failed',
 
-  for (const promise of activePromises) {
-    await fulfillPromise(promise.id);
-  }
+        reason:
+          reason ||
+          'Payment attempt failed.',
 
-  // Record success action
-  await prisma.aIAction.create({
-    data: {
-      invoiceId: updatedPayment.invoiceId,
-      action: 'payment_received',
-      reason: `Payment of ₹${updatedPayment.amount.toLocaleString(
-        'en-IN'
-      )} received via ${
-        verifiedData.method || 'Razorpay Payment Link'
-      }.`,
-      confidence: 1.0,
-      policyDecision: 'ALLOW',
-      policyReason: 'Verified payment received.',
-      result: JSON.stringify({
-        paymentId: razorpayPaymentId,
-        paymentLinkId: updatedPayment.paymentLinkId,
-        amount: updatedPayment.amount,
-        method: verifiedData.method,
-        status: 'SUCCESS',
-      }),
-      actor: 'webhook',
-    },
-  });
+        confidence:
+          1,
 
-  return {
-    success: true,
-    message: `Payment of ₹${updatedPayment.amount.toLocaleString(
-      'en-IN'
-    )} confirmed. Invoice marked as paid.`,
-    paymentId: updatedPayment.id,
-    amount: updatedPayment.amount,
-  };
-}
+        policyDecision:
+          'ALLOW',
 
-// ── Handle Payment Link Failed ──────────────────────────────
+        policyReason:
+          'Payment failure recorded for recovery tracking.',
 
-export async function handlePaymentLinkFailed(
-  paymentLinkId: string,
-  failureReason: string
-): Promise<PaymentResult> {
-  const payment = await prisma.payment.findFirst({
-    where: { paymentLinkId },
-  });
+        result:
+          JSON.stringify({
+            paymentId:
+              payment.id,
 
-  if (!payment) {
-    return {
-      success: false,
-      message: `No payment record found for link ${paymentLinkId}.`,
-    };
-  }
+            reason:
+              reason ||
+              'Unknown payment failure',
+          }),
 
-  if (payment.status === 'failed') {
+        actor:
+          'engine',
+      },
+    });
+
     return {
       success: true,
-      message: 'Failure already recorded.',
+
+      message:
+        'Payment failure recorded.',
+
+      paymentId:
+        payment.id,
+    };
+  } catch (error) {
+    console.error(
+      '[Payment] Payment failure handler failed:',
+      error
+    );
+
+    return {
+      success: false,
+
+      message:
+        error instanceof Error
+          ? error.message
+          : 'Failed to record payment failure.',
     };
   }
-
-  await prisma.payment.update({
-    where: { id: payment.id },
-    data: {
-      status: 'failed',
-      failureReason,
-    },
-  });
-
-  await prisma.aIAction.create({
-    data: {
-      invoiceId: payment.invoiceId,
-      action: 'payment_failed',
-      reason: `Payment via link failed: ${failureReason}`,
-      confidence: 1.0,
-      policyDecision: 'ALLOW',
-      policyReason: 'Payment failure recorded.',
-      result: JSON.stringify({
-        paymentLinkId,
-        amount: payment.amount,
-        failureReason,
-        status: 'FAILED',
-      }),
-      actor: 'webhook',
-    },
-  });
-
-  return {
-    success: true,
-    message: 'Payment failure recorded. Invoice remains outstanding.',
-    paymentId: payment.id,
-  };
 }
 
-// ── Demo Payment Completion ─────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Complete Demo Payment
+// ─────────────────────────────────────────────────────────────
 
 export async function completeDemoPayment(
   paymentId: string
 ): Promise<PaymentResult> {
-  const payment = await prisma.payment.findUnique({
-    where: { id: paymentId },
-  });
+  try {
+    const payment =
+      await prisma.payment.findUnique({
+        where: {
+          id:
+            paymentId,
+        },
 
-  if (!payment) {
+        include: {
+          invoice: true,
+        },
+      });
+
+    if (!payment) {
+      return {
+        success: false,
+
+        message:
+          'Payment not found.',
+      };
+    }
+
+    if (!payment.isDemo) {
+      return {
+        success: false,
+
+        message:
+          'This is not a demo payment.',
+      };
+    }
+
+    if (payment.status === 'paid') {
+      return {
+        success: true,
+
+        message:
+          'Payment has already been completed.',
+
+        paymentId:
+          payment.id,
+      };
+    }
+
+    // ----------------------------------------------------------
+    // Complete demo payment directly
+    // ----------------------------------------------------------
+
+    await prisma.payment.update({
+      where: {
+        id:
+          payment.id,
+      },
+
+      data: {
+        status:
+          'paid',
+
+        razorpayPaymentId:
+          `demo_pay_${payment.id}`,
+      },
+    });
+
+    // ----------------------------------------------------------
+    // Mark invoice recovered
+    // ----------------------------------------------------------
+
+    await prisma.invoice.update({
+      where: {
+        id:
+          payment.invoiceId,
+      },
+
+      data: {
+        status:
+          'paid',
+
+        paidAt:
+          new Date(),
+
+        recoveryStatus:
+          'recovered',
+
+        recoverySource:
+          'demo_payment',
+      },
+    });
+
+    // ----------------------------------------------------------
+    // Fulfill active promise
+    // ----------------------------------------------------------
+
+    try {
+      await fulfillPromise(
+        payment.invoiceId
+      );
+    } catch (promiseError) {
+      console.error(
+        '[Payment] Demo promise fulfillment failed:',
+        promiseError
+      );
+    }
+
+    // ----------------------------------------------------------
+    // Audit action
+    // ----------------------------------------------------------
+
+    await prisma.aIAction.create({
+      data: {
+        invoiceId:
+          payment.invoiceId,
+
+        action:
+          'payment_received',
+
+        reason:
+          'Demo payment completed and invoice recovered.',
+
+        confidence:
+          1,
+
+        policyDecision:
+          'ALLOW',
+
+        policyReason:
+          'Demo payment completion permitted by the payment engine.',
+
+        result:
+          JSON.stringify({
+            provider:
+              'demo',
+
+            paymentId:
+              payment.id,
+
+            demoPaymentId:
+              `demo_pay_${payment.id}`,
+
+            amount:
+              Number(payment.amount),
+
+            currency:
+              payment.currency,
+          }),
+
+        actor:
+          'engine',
+      },
+    });
+
+    return {
+      success: true,
+
+      message:
+        'Demo payment completed successfully.',
+
+      paymentId:
+        payment.id,
+
+      amount:
+        Number(payment.amount),
+
+      currency:
+        payment.currency || 'INR',
+    };
+  } catch (error) {
+    console.error(
+      '[Payment] Demo payment completion failed:',
+      error
+    );
+
     return {
       success: false,
-      message: 'Payment not found.',
+
+      message:
+        error instanceof Error
+          ? error.message
+          : 'Failed to complete demo payment.',
     };
   }
+}
 
-  if (payment.status !== 'created') {
-    return {
-      success: false,
-      message: `Payment is already ${payment.status}.`,
-    };
-  }
+// ─────────────────────────────────────────────────────────────
+// Legacy Payment Link Support
+// ─────────────────────────────────────────────────────────────
 
-  // Simulate payment success
+export async function handlePaymentLinkPaid(
+  paymentId: string,
+  razorpayPaymentId: string,
+  razorpayOrderId: string
+): Promise<PaymentResult> {
   return handlePaymentSuccess(
-    `pay_demo_${Date.now()}`,
-    payment.razorpayOrderId || ''
+    razorpayPaymentId,
+    razorpayOrderId
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Process Successful Payment
+// ─────────────────────────────────────────────────────────────
+
+export async function processSuccessfulPayment(
+  paymentId: string,
+  razorpayPaymentId: string,
+  razorpayOrderId: string
+): Promise<PaymentResult> {
+  return handlePaymentSuccess(
+    razorpayPaymentId,
+    razorpayOrderId
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Legacy Payment Link Failure
+// ─────────────────────────────────────────────────────────────
+
+export async function handlePaymentLinkFailed(
+  paymentId: string,
+  reason?: string
+): Promise<PaymentResult> {
+  return handlePaymentFailure(
+    paymentId,
+    reason
   );
 }
