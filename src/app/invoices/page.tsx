@@ -287,13 +287,14 @@ export default async function InvoicesPage() {
                         : invoice.status || 'Pending';
 
                     /*
-                     * Use the invoice recovery score directly.
-                     * Fall back to 33 if no score is available.
+                     * recoveryProbability is a 0-1 float stored on the
+                     * Invoice model. Multiply by 100 for display.
+                     * Fall back to 0 if not set.
                      */
                     const recoveryScore =
-  invoice.customer?.riskScore != null
-    ? Number(invoice.customer.riskScore)
-    : 33;
+                      invoice.recoveryProbability != null
+                        ? Math.round(Number(invoice.recoveryProbability) * 100)
+                        : 0;
 
                     return (
                       <tr
