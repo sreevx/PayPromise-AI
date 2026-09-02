@@ -762,9 +762,16 @@ export async function handlePaymentSuccess(
     // ----------------------------------------------------------
 
     try {
-      await fulfillPromise(
-        payment.invoiceId
-      );
+      const activePromise = await prisma.promiseToPay.findFirst({
+        where: {
+          invoiceId: payment.invoiceId,
+          status: 'active',
+        },
+      });
+
+      if (activePromise) {
+        await fulfillPromise(activePromise.id);
+      }
     } catch (promiseError) {
       console.error(
         '[Payment] Promise fulfillment failed:',
@@ -1070,9 +1077,16 @@ export async function completeDemoPayment(
     // ----------------------------------------------------------
 
     try {
-      await fulfillPromise(
-        payment.invoiceId
-      );
+      const activePromise = await prisma.promiseToPay.findFirst({
+        where: {
+          invoiceId: payment.invoiceId,
+          status: 'active',
+        },
+      });
+
+      if (activePromise) {
+        await fulfillPromise(activePromise.id);
+      }
     } catch (promiseError) {
       console.error(
         '[Payment] Demo promise fulfillment failed:',
@@ -1194,11 +1208,21 @@ export async function processSuccessfulPayment(
 // ─────────────────────────────────────────────────────────────
 
 export async function handlePaymentLinkFailed(
-  paymentId: string,
+  paymentLinkId: string,
   reason?: string
 ): Promise<PaymentResult> {
-  return handlePaymentFailure(
-    paymentId,
-    reason
-  );
+  // paymentLinkId is the Razorpay plink_xxx ID, not our local payment ID.
+  // Look up the local payment by paymentLinkId.
+  const payment = await prisma.payment.findFirst({
+    where: { paymentLinkId },
+  });
+
+  if (!payment) {
+    return {
+      success: false,
+      message: `No local payment found for Razorpay Payment Link ${paymentLinkId}.`,
+    };
+  }
+
+  return handlePaymentFailure(payment.id, reason);
 }

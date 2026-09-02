@@ -186,9 +186,12 @@ export async function fetchRazorpayPayment(
 
 export function verifyWebhookSignature(
   body: string,
-  signature: string
+  signature: string,
+  secretOverride?: string
 ): boolean {
-  if (!RAZORPAY_WEBHOOK_SECRET) {
+  const secret = secretOverride || RAZORPAY_WEBHOOK_SECRET;
+
+  if (!secret) {
     if (process.env.NODE_ENV === 'production') {
       console.error(
         '[Razorpay] Webhook secret not configured. Rejecting webhook.'
@@ -212,12 +215,12 @@ export function verifyWebhookSignature(
     return false;
   }
 
-  const crypto = require('crypto');
+  const nodeCrypto = require('crypto');
 
-  const expectedSignature = crypto
+  const expectedSignature = nodeCrypto
     .createHmac(
       'sha256',
-      RAZORPAY_WEBHOOK_SECRET
+      secret
     )
     .update(body)
     .digest('hex');

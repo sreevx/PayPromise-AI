@@ -5,6 +5,7 @@ import { notFound } from 'next/navigation';
 
 import { prisma } from '@/lib/prisma';
 import RazorpayPayment from './RazorpayPayment';
+import { RecoveryActions } from './RecoveryActions';
 
 type PageProps = {
   params: {
@@ -22,7 +23,7 @@ export default async function InvoicePage({
 
     include: {
       customer: true,
-
+      commitments: true,
       payments: {
         orderBy: {
           createdAt: 'desc',
@@ -44,12 +45,7 @@ export default async function InvoicePage({
 
   const recoveryProbability =
     Number(
-      (invoice as any).recoveryProbability ?? 0
-    );
-
-  const recoveryScore =
-    Number(
-      (invoice as any).recoveryScore ?? 0
+      invoice.recoveryProbability ?? 0
     );
 
   const status =
@@ -165,19 +161,17 @@ export default async function InvoicePage({
 
               </div>
 
-              {/* Recovery Score */}
+              {/* Recovery Probability */}
               <div className="rounded-xl bg-white/5 p-4">
 
                 <p className="text-xs uppercase tracking-wide text-slate-500">
-                  Recovery Score
+                  Recovery Probability
                 </p>
 
                 <p className="mt-2 font-semibold">
-                  {recoveryScore > 0
-                    ? recoveryScore
-                    : `${(
-                        recoveryProbability * 100
-                      ).toFixed(0)}%`}
+                  {(
+                    recoveryProbability * 100
+                  ).toFixed(0)}%
                 </p>
 
               </div>
@@ -305,18 +299,7 @@ export default async function InvoicePage({
 
             </div>
 
-            {/* Recovery Score */}
-            <div className="rounded-xl bg-white/5 p-4">
 
-              <p className="text-xs uppercase tracking-wide text-slate-500">
-                Recovery Score
-              </p>
-
-              <p className="mt-2 text-2xl font-bold">
-                {recoveryScore || '—'}
-              </p>
-
-            </div>
 
             {/* Current Status */}
             <div className="rounded-xl bg-white/5 p-4">
@@ -334,6 +317,16 @@ export default async function InvoicePage({
           </div>
 
         </section>
+
+        {/* Recovery Actions */}
+        <RecoveryActions
+          invoiceId={invoice.id}
+          invoiceStatus={invoice.status}
+          isActionable={invoice.status !== 'paid' && invoice.status !== 'pending' && invoice.status !== 'written_off'}
+          escalationLevel={invoice.escalationLevel}
+          activePromises={invoice.commitments?.filter((c: { status: string }) => c.status === 'active').length ?? 0}
+          invoiceAmount={amount}
+        />
 
         {/* Latest Payment */}
         {existingPayment && (

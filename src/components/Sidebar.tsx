@@ -68,9 +68,7 @@ export function Sidebar() {
                   >
                     <span className="text-base">{item.icon}</span>
                     <span>{item.name}</span>
-                    {item.name === 'Invoices' && (
-                      <span className="ml-auto bg-red-100 text-red-600 text-[10px] font-bold px-1.5 py-0.5 rounded-full">14</span>
-                    )}
+
                   </Link>
                 );
               })}

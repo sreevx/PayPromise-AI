@@ -1,6 +1,8 @@
 import Link from 'next/link';
 import { prisma } from '@/lib/prisma';
 
+export const dynamic = 'force-dynamic';
+
 function formatCurrency(amount: number) {
   return `₹${amount.toLocaleString('en-IN')}`;
 }
@@ -265,9 +267,7 @@ export default async function InvoicesPage() {
                     const payment = invoice.payments[0];
 
                     /*
-                     * recoveryAnalyses does not exist as an
-                     * Invoice Prisma relation, so recoveryScore
-                     * is taken directly from the invoice.
+                     * recoveryProbability is a 0-1 float on the Invoice model.
                      */
                     const isPaid =
                       invoice.recoveryStatus === 'paid' ||
@@ -287,13 +287,13 @@ export default async function InvoicesPage() {
                         : invoice.status || 'Pending';
 
                     /*
-                     * Use the invoice recovery score directly.
-                     * Fall back to 33 if no score is available.
+                     * recoveryProbability is a 0-1 float stored on the
+                     * Invoice model. Multiply by 100 for display.
                      */
                     const recoveryScore =
-  invoice.customer?.riskScore != null
-    ? Number(invoice.customer.riskScore)
-    : 33;
+                      invoice.recoveryProbability != null
+                        ? Math.round(Number(invoice.recoveryProbability) * 100)
+                        : 0;
 
                     return (
                       <tr

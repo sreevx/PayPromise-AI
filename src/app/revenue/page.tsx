@@ -4,7 +4,6 @@ import { formatCurrency } from '@/lib/utils';
 export const dynamic = 'force-dynamic';
 
 export default async function RevenuePage() {
-  const metrics = await prisma.revenueMetrics.findFirst();
   const allInvoices = await prisma.invoice.findMany({
     include: { customer: true },
   });
@@ -12,6 +11,12 @@ export default async function RevenuePage() {
   const overdue = allInvoices.filter(i => i.status === 'overdue');
   const pending = allInvoices.filter(i => i.status === 'pending');
   const paid = allInvoices.filter(i => i.status === 'paid');
+
+  // Compute live metrics from invoice data (not stale RevenueMetrics table)
+  const totalRevenue = allInvoices.reduce((s, i) => s + i.amount, 0);
+  const revenueAtRisk = overdue.reduce((s, i) => s + i.amount, 0);
+  const revenueRecovered = paid.reduce((s, i) => s + i.amount, 0);
+  const recoveryRate = totalRevenue > 0 ? revenueRecovered / totalRevenue : 0;
 
   const overdueByAge = {
     '1-7 days': overdue.filter(i => {
@@ -55,21 +60,21 @@ export default async function RevenuePage() {
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
         <div className="bg-white rounded-xl border border-gray-100 p-6">
           <p className="text-xs font-medium text-gray-500 mb-1">Total Revenue (All Invoices)</p>
-          <p className="text-2xl font-bold text-gray-900">{formatCurrency(metrics?.totalRevenue ?? 0)}</p>
+          <p className="text-2xl font-bold text-gray-900">{formatCurrency(totalRevenue)}</p>
         </div>
         <div className="bg-white rounded-xl border border-gray-100 p-6">
           <p className="text-xs font-medium text-gray-500 mb-1">Revenue at Risk</p>
-          <p className="text-2xl font-bold text-red-600">{formatCurrency(metrics?.revenueAtRisk ?? 0)}</p>
+          <p className="text-2xl font-bold text-red-600">{formatCurrency(revenueAtRisk)}</p>
           <p className="text-xs text-red-500 mt-1">{overdue.length} overdue invoices</p>
         </div>
         <div className="bg-white rounded-xl border border-gray-100 p-6">
           <p className="text-xs font-medium text-gray-500 mb-1">Revenue Recovered</p>
-          <p className="text-2xl font-bold text-green-600">{formatCurrency(metrics?.revenueRecovered ?? 0)}</p>
+          <p className="text-2xl font-bold text-green-600">{formatCurrency(revenueRecovered)}</p>
           <p className="text-xs text-green-600 mt-1">{paid.length} invoices recovered</p>
         </div>
         <div className="bg-white rounded-xl border border-gray-100 p-6">
           <p className="text-xs font-medium text-gray-500 mb-1">Recovery Rate</p>
-          <p className="text-2xl font-bold text-blue-600">{((metrics?.aiRecoveryRate ?? 0) * 100).toFixed(0)}%</p>
+          <p className="text-2xl font-bold text-blue-600">{(recoveryRate * 100).toFixed(0)}%</p>
           <p className="text-xs text-gray-500 mt-1">AI-powered recovery</p>
         </div>
       </div>
