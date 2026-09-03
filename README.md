@@ -505,14 +505,10 @@ npx prisma db push
 ## 6. Seed demonstration data
 
 ```bash
-npx prisma db seed
+npm run db:seed
 ```
 
-If your environment is configured to execute the seed script directly, you can also use:
-
-```bash
-npx tsx prisma/seed.ts
-```
+(The npm script runs the TypeScript seed directly via `tsx`.)
 
 ## 7. Start the development server
 
